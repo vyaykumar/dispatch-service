@@ -1,0 +1,13 @@
+# CLion
+.idea/
+cmake-build-*/
+
+# CMake (if built outside CLion's default build dirs)
+/build/
+CMakeUserPresets.json
+
+# Windows / MSVC
+*.obj
+*.pdb
+*.ilk
+*.exe
