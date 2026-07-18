@@ -1,183 +1,115 @@
-// Smoke test: proves raw TCP sockets work end to end on this machine/
-// compiler before any real project code gets written. No external
-// dependencies — this is the whole point of dropping gRPC.
+// Step 1 smoke test: proves protocol.h + transport.h work together end to
+// end. Runs a worker on a background thread that speaks the real
+// TASK_SUBMIT -> TASK_ACK -> TASK_RESULT sequence, then a dispatcher-ish
+// client drives it.
 //
-// Implements the Step 1 wire framing from the handout in miniature:
-// [4-byte big-endian length][1-byte type][payload bytes]
-//
-// Runs a trivial echo-ish server on a background thread, then connects
-// to it as a client and exchanges one frame.
-//
-// This is throwaway scaffolding for Step 0 — not part of the real
-// dispatcher/worker design.
+// This is still throwaway scaffolding — the real dispatcher/worker
+// binaries come in Steps 2-3 and will reuse protocol.h/transport.h as-is.
 
 #include <chrono>
-#include <cstdint>
-#include <cstring>
 #include <iostream>
-#include <optional>
-#include <string>
 #include <thread>
-#include <vector>
 
-#ifdef _WIN32
-#include <winsock2.h>
-#include <ws2tcpip.h>
-using socket_t = SOCKET;
-constexpr socket_t kInvalidSocket = INVALID_SOCKET;
-#else
-#include <arpa/inet.h>
-#include <netinet/in.h>
-#include <sys/socket.h>
-#include <unistd.h>
-using socket_t = int;
-constexpr socket_t kInvalidSocket = -1;
-#endif
+#include "protocol.h"
+#include "transport.h"
+
+using transport::socket_t;
 
 namespace {
 
-constexpr uint16_t kPort = 50051;
+    constexpr uint16_t kPort = 50051;
 
-enum class MessageType : uint8_t { kPing = 1, kPong = 2 };
+    void RunWorker(std::stop_token /*stopToken*/) {
+        socket_t listener = socket(AF_INET, SOCK_STREAM, 0);
 
-struct Frame {
-    MessageType type;
-    std::vector<uint8_t> payload;
-};
+        sockaddr_in addr{};
+        addr.sin_family = AF_INET;
+        addr.sin_addr.s_addr = INADDR_ANY;
+        addr.sin_port = htons(kPort);
 
-void PlatformInit() {
-#ifdef _WIN32
-    WSADATA wsaData;
-    WSAStartup(MAKEWORD(2, 2), &wsaData);
-#endif
-}
+        bind(listener, reinterpret_cast<sockaddr*>(&addr), sizeof(addr));
+        listen(listener, 1);
+        std::cout << "[worker] listening on port " << kPort << "\n";
 
-void PlatformCleanup() {
-#ifdef _WIN32
-    WSACleanup();
-#endif
-}
+        socket_t client = accept(listener, nullptr, nullptr);
+        if (client != transport::kInvalidSocket) {
+            auto msg = protocol::ReceiveMessage(client);
+            if (msg && msg->type == protocol::MessageType::kTaskSubmit) {
+                std::cout << "[worker] received TASK_SUBMIT: task_id="
+                          << msg->submit.taskId
+                          << " idempotency_key=" << msg->submit.idempotencyKey << "\n";
 
-void CloseSocket(socket_t s) {
-#ifdef _WIN32
-    closesocket(s);
-#else
-    close(s);
-#endif
-}
+                // Ack immediately, before "executing".
+                protocol::SendTaskAck(client, {msg->submit.taskId});
+                std::cout << "[worker] sent TASK_ACK\n";
 
-// Reads exactly n bytes into buf, looping over partial reads (TCP makes
-// no promise that recv() returns a full message in one call).
-bool RecvExact(socket_t s, uint8_t* buf, size_t n) {
-    size_t received = 0;
-    while (received < n) {
-        int chunk = recv(s, reinterpret_cast<char*>(buf + received),
-                          static_cast<int>(n - received), 0);
-        if (chunk <= 0) return false;
-        received += static_cast<size_t>(chunk);
-    }
-    return true;
-}
+                // Pretend to do the work.
+                std::this_thread::sleep_for(std::chrono::milliseconds(100));
 
-bool SendFrame(socket_t s, MessageType type, const std::string& payload) {
-    uint32_t len = static_cast<uint32_t>(payload.size());
-    uint32_t lenBE = htonl(len);
-    uint8_t typeByte = static_cast<uint8_t>(type);
-
-    std::vector<uint8_t> buf;
-    buf.resize(4 + 1 + payload.size());
-    std::memcpy(buf.data(), &lenBE, 4);
-    buf[4] = typeByte;
-    std::memcpy(buf.data() + 5, payload.data(), payload.size());
-
-    size_t sent = 0;
-    while (sent < buf.size()) {
-        int chunk = send(s, reinterpret_cast<char*>(buf.data() + sent),
-                          static_cast<int>(buf.size() - sent), 0);
-        if (chunk <= 0) return false;
-        sent += static_cast<size_t>(chunk);
-    }
-    return true;
-}
-
-std::optional<Frame> RecvFrame(socket_t s) {
-    uint8_t header[5];
-    if (!RecvExact(s, header, 5)) return std::nullopt;
-
-    uint32_t lenBE;
-    std::memcpy(&lenBE, header, 4);
-    uint32_t len = ntohl(lenBE);
-    MessageType type = static_cast<MessageType>(header[4]);
-
-    std::vector<uint8_t> payload(len);
-    if (len > 0 && !RecvExact(s, payload.data(), len)) return std::nullopt;
-
-    return Frame{type, std::move(payload)};
-}
-
-void RunServer(std::stop_token stopToken) {
-    socket_t listener = socket(AF_INET, SOCK_STREAM, 0);
-
-    sockaddr_in addr{};
-    addr.sin_family = AF_INET;
-    addr.sin_addr.s_addr = INADDR_ANY;
-    addr.sin_port = htons(kPort);
-
-    bind(listener, reinterpret_cast<sockaddr*>(&addr), sizeof(addr));
-    listen(listener, 1);
-    std::cout << "[server] listening on port " << kPort << "\n";
-
-    // Accept exactly one connection for this smoke test.
-    socket_t client = accept(listener, nullptr, nullptr);
-    if (client != kInvalidSocket) {
-        auto frame = RecvFrame(client);
-        if (frame && frame->type == MessageType::kPing) {
-            std::string received(frame->payload.begin(), frame->payload.end());
-            std::cout << "[server] received ping: " << received << "\n";
-            SendFrame(client, MessageType::kPong, "pong: " + received);
+                std::string resultText = "processed: " +
+                                         std::string(msg->submit.payload.begin(), msg->submit.payload.end());
+                protocol::TaskResult result{
+                        msg->submit.taskId,
+                        protocol::TaskStatus::kSucceeded,
+                        std::vector<uint8_t>(resultText.begin(), resultText.end())
+                };
+                protocol::SendTaskResult(client, result);
+                std::cout << "[worker] sent TASK_RESULT\n";
+            }
+            transport::CloseSocket(client);
         }
-        CloseSocket(client);
+        transport::CloseSocket(listener);
     }
-    CloseSocket(listener);
-}
 
 }  // namespace
 
 int main() {
-    PlatformInit();
+    transport::PlatformInit();
 
-    std::jthread serverThread(RunServer);
+    std::jthread workerThread(RunWorker);
 
-    // Give the server a moment to start listening.
     std::this_thread::sleep_for(std::chrono::milliseconds(200));
 
-    socket_t client = socket(AF_INET, SOCK_STREAM, 0);
-
+    socket_t sock = socket(AF_INET, SOCK_STREAM, 0);
     sockaddr_in serverAddr{};
     serverAddr.sin_family = AF_INET;
     serverAddr.sin_port = htons(kPort);
     inet_pton(AF_INET, "127.0.0.1", &serverAddr.sin_addr);
 
-    if (connect(client, reinterpret_cast<sockaddr*>(&serverAddr), sizeof(serverAddr)) != 0) {
-        std::cout << "[client] connect failed\n";
+    if (connect(sock, reinterpret_cast<sockaddr*>(&serverAddr), sizeof(serverAddr)) != 0) {
+        std::cout << "[dispatcher] connect failed\n";
         return 1;
     }
 
-    SendFrame(client, MessageType::kPing, "hello from client");
+    protocol::TaskSubmit submit{
+            "task-0001",
+            "idem-key-abc",
+            std::vector<uint8_t>{'h', 'e', 'l', 'l', 'o'}
+    };
+    protocol::SendTaskSubmit(sock, submit);
+    std::cout << "[dispatcher] sent TASK_SUBMIT\n";
 
-    auto reply = RecvFrame(client);
-    if (reply && reply->type == MessageType::kPong) {
-        std::string message(reply->payload.begin(), reply->payload.end());
-        std::cout << "[client] received: " << message << "\n";
-        std::cout << "Toolchain OK.\n";
-    } else {
-        std::cout << "[client] no valid reply received\n";
-        CloseSocket(client);
+    auto ackMsg = protocol::ReceiveMessage(sock);
+    if (!ackMsg || ackMsg->type != protocol::MessageType::kTaskAck) {
+        std::cout << "[dispatcher] did not receive expected TASK_ACK\n";
         return 1;
     }
+    std::cout << "[dispatcher] received TASK_ACK for task_id=" << ackMsg->ack.taskId << "\n";
 
-    CloseSocket(client);
-    serverThread.join();
-    PlatformCleanup();
+    auto resultMsg = protocol::ReceiveMessage(sock);
+    if (!resultMsg || resultMsg->type != protocol::MessageType::kTaskResult) {
+        std::cout << "[dispatcher] did not receive expected TASK_RESULT\n";
+        return 1;
+    }
+    std::string resultText(resultMsg->result.payload.begin(), resultMsg->result.payload.end());
+    std::cout << "[dispatcher] received TASK_RESULT: status="
+              << static_cast<int>(resultMsg->result.status)
+              << " payload=\"" << resultText << "\"\n";
+
+    std::cout << "Protocol OK.\n";
+
+    transport::CloseSocket(sock);
+    workerThread.join();
+    transport::PlatformCleanup();
     return 0;
 }
