@@ -9,7 +9,7 @@ enum class FieldId : uint8_t {
 
 class FieldWriter {
 public:
-    void addString(FieldId id, const std::string_view value) {
+    void addString(FieldId id, std::string_view value) {
         payload_.emplace_back(static_cast<uint8_t>(id));
 
         const uint32_t length = value.size();
@@ -52,6 +52,12 @@ private:
     std::vector<uint8_t> payload_;
 };
 
+
+
+
+
+// < --------------------------- First Pass Begins Here ---------------------------->
+//
 // The following takes only one message inside its payload. What if we want to sent multiple at once?
 // A vector of messages(=T+L+V)?
 // For now, lets write for a single message payload.
