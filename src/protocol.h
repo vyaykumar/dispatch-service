@@ -9,14 +9,17 @@
 
 #include <cstdint>
 #include <cstring>
-#include <map>
+#include <unordered_map>
 #include <optional>
 #include <string>
 #include <vector>
+#include <expected>
 
 #include "transport.h"
 
 namespace protocol {
+
+using FieldMap = std::pmr::unordered_map<uint8_t, std::vector<uint8_t>>;
 
 enum class MessageType : uint8_t {
     kTaskSubmit = 1,
@@ -37,6 +40,11 @@ enum class FieldId : uint8_t {
     kIdempotencyKey = 2,
     kStatus = 3,
     kPayload = 4,
+};
+
+enum class ParseError : uint8_t {
+    TruncHeader = 0,
+    TruncValue
 };
 
 // ---- TLV encode/decode ----
@@ -66,32 +74,74 @@ private:
     std::vector<uint8_t> buf_;
 };
 
-// Parses a TLV payload into a field-id -> bytes map. Malformed trailing
-// data is treated as a parse failure (returns nullopt) rather than
-// silently ignored, since a truncated field is a real protocol error,
-// not a forward-compatibility case.
-inline std::optional<std::map<uint8_t, std::vector<uint8_t>>>
-ParseFields(const std::vector<uint8_t>& payload) {
-    std::map<uint8_t, std::vector<uint8_t>> fields;
-    size_t pos = 0;
-    while (pos < payload.size()) {
-        if (pos + 5 > payload.size()) return std::nullopt;  // truncated header
+/*
+    ParseFields function will take in an input stream of bytes,
+    and out a raw byte lookup map.
 
-        uint8_t id = payload[pos];
-        uint32_t lenBE;
-        std::memcpy(&lenBE, payload.data() + pos + 1, 4);
-        uint32_t len = ntohl(lenBE);
-        pos += 5;
+    const uint8_t* input_stream : Pointer to the first byte in the input stream. Marks the start of the payload.
+    const std::size_t size      : Size of the payload.
 
-        if (pos + len > payload.size()) return std::nullopt;  // truncated value
+    Return types:
+        on success, std::map <uint8_t, std::vector<uint8_t>>.
+        on failure, either of enum class ParseError.
 
-        fields[id] = std::vector<uint8_t>(payload.begin() + pos, payload.begin() + pos + len);
-        pos += len;
+    Everything valid is stored as raw bytes in the vector. Can be manipulated as needed.
+    NOTE: Last-Write wins, under duplicate contention.
+*/
+
+[[nodiscard]] std::expected<FieldMap, ParseError> ParseFields (const uint8_t* input_stream, const std::size_t size) {
+    FieldMap output {};
+
+    if (size == 0)
+        return output;
+
+    size_t offset {0};
+
+    // Don't manipulate value to any type.
+    // Hand if off as a uint8_t vector only.
+    while (offset < size) {
+        // Check for TruncHeader
+        if (size - offset < 5)
+            return std::unexpected(ParseError::TruncHeader);
+
+        // Read Type
+        const uint8_t type = input_stream[offset++];
+
+        // Read Length
+        uint32_t length {};
+        // for (size_t idx {0}; idx < 4; idx++) {
+        //     length <<= 8;
+        //     length |= input_stream[offset++];
+        // }
+        std::memcpy(&length, input_stream + offset, 4);
+        if constexpr (std::endian::native == std::endian::little)
+            length = std::byteswap(length);
+        offset += 4;
+
+
+        // Since this function don't have to interpret,
+        // length-slice of inputs can be pushed into a vector.
+
+        // Check for TruncVal
+        if (length > size - offset)
+            return std::unexpected(ParseError::TruncValue);
+
+        // std::vector<uint8_t> value;
+        // for (size_t idx {0}; idx < length; idx++)
+        //     value.emplace_back(input_stream[offset++]);
+
+        std::vector value(input_stream + offset, input_stream + offset + length);
+        offset += length;
+
+        // output.insert({type, value});
+        // output[type] = std::move(value);
+        output.insert_or_assign(type, std::move(value));    // Returns whether it assigned or overwrote.
     }
-    return fields;
+
+    return output;
 }
 
-inline std::string FieldAsString(const std::map<uint8_t, std::vector<uint8_t>>& fields, FieldId id) {
+inline std::string FieldAsString(const FieldMap& fields, FieldId id) {
     auto it = fields.find(static_cast<uint8_t>(id));
     if (it == fields.end()) return {};
     return std::string(it->second.begin(), it->second.end());
@@ -165,7 +215,7 @@ inline std::optional<DecodedMessage> ReceiveMessage(transport::socket_t s) {
     auto raw = transport::RecvFrame(s);
     if (!raw) return std::nullopt;
 
-    auto fields = ParseFields(raw->payload);
+    auto fields = ParseFields(raw->payload.data(), raw->payload.size());
     if (!fields) return std::nullopt;
 
     DecodedMessage msg{};
