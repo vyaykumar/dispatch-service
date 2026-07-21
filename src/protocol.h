@@ -49,30 +49,45 @@ enum class ParseError : uint8_t {
 
 // ---- TLV encode/decode ----
 
-class FieldWriter {
-public:
-    void AddString(FieldId id, const std::string& value) {
-        AddBytes(id, std::vector<uint8_t>(value.begin(), value.end()));
-    }
+    class FieldWriter {
+    public:
 
-    void AddByte(FieldId id, uint8_t value) {
-        AddBytes(id, std::vector<uint8_t>{value});
-    }
+        void AddField (FieldId id, const uint32_t length) {
+            payload_.emplace_back(static_cast<uint8_t>(id));
+            for (size_t idx {0}; idx < 4; idx++)
+                payload_.emplace_back(length >> (8*(3-idx)) & 0xFF);
+        }
 
-    void AddBytes(FieldId id, const std::vector<uint8_t>& value) {
-        buf_.push_back(static_cast<uint8_t>(id));
-        uint32_t lenBE = htonl(static_cast<uint32_t>(value.size()));
-        uint8_t lenBytes[4];
-        std::memcpy(lenBytes, &lenBE, 4);
-        buf_.insert(buf_.end(), lenBytes, lenBytes + 4);
-        buf_.insert(buf_.end(), value.begin(), value.end());
-    }
+        void AddString(const FieldId id, std::string_view value) {
+            AddField(id,value.size());
 
-    const std::vector<uint8_t>& bytes() const { return buf_; }
+            for (const auto& element : value)
+                payload_.emplace_back(static_cast<uint8_t>(element));
+        }
+        void AddByte(const FieldId id, uint8_t value) {
+            AddField(id,1);
 
-private:
-    std::vector<uint8_t> buf_;
-};
+            payload_.emplace_back(value);
+        }
+        void AddRaw(FieldId id, std::span<const uint8_t> value) {
+            AddField(id,value.size());
+
+            payload_.insert(payload_.end(), value.begin(), value.end());
+        }
+
+        // Inspection copy.
+        [[nodiscard]] const std::vector<uint8_t>& payload() const {
+            return payload_;
+        }
+
+        // Consumption copy. Do not use FieldWriter after usage.
+        [[nodiscard]] std::vector<uint8_t> finish() && {
+            return std::move(payload_);
+        }
+
+    private:
+        std::vector<uint8_t> payload_;
+    };
 
 /*
     ParseFields function will take in an input stream of bytes,
@@ -175,28 +190,28 @@ inline bool SendTaskSubmit(transport::socket_t s, const TaskSubmit& msg) {
     FieldWriter w;
     w.AddString(FieldId::kTaskId, msg.taskId);
     w.AddString(FieldId::kIdempotencyKey, msg.idempotencyKey);
-    w.AddBytes(FieldId::kPayload, msg.payload);
-    return transport::SendFrame(s, static_cast<uint8_t>(MessageType::kTaskSubmit), w.bytes());
+    w.AddRaw(FieldId::kPayload, msg.payload);
+    return transport::SendFrame(s, static_cast<uint8_t>(MessageType::kTaskSubmit), std::move(w).finish());
 }
 
 inline bool SendTaskAck(transport::socket_t s, const TaskAck& msg) {
     FieldWriter w;
     w.AddString(FieldId::kTaskId, msg.taskId);
-    return transport::SendFrame(s, static_cast<uint8_t>(MessageType::kTaskAck), w.bytes());
+    return transport::SendFrame(s, static_cast<uint8_t>(MessageType::kTaskAck), std::move(w).finish());
 }
 
 inline bool SendTaskResult(transport::socket_t s, const TaskResult& msg) {
     FieldWriter w;
     w.AddString(FieldId::kTaskId, msg.taskId);
     w.AddByte(FieldId::kStatus, static_cast<uint8_t>(msg.status));
-    w.AddBytes(FieldId::kPayload, msg.payload);
-    return transport::SendFrame(s, static_cast<uint8_t>(MessageType::kTaskResult), w.bytes());
+    w.AddRaw(FieldId::kPayload, msg.payload);
+    return transport::SendFrame(s, static_cast<uint8_t>(MessageType::kTaskResult), std::move(w).finish());
 }
 
 inline bool SendCancel(transport::socket_t s, const Cancel& msg) {
     FieldWriter w;
     w.AddString(FieldId::kTaskId, msg.taskId);
-    return transport::SendFrame(s, static_cast<uint8_t>(MessageType::kCancel), w.bytes());
+    return transport::SendFrame(s, static_cast<uint8_t>(MessageType::kCancel), std::move(w).finish());
 }
 
 // ---- Decode: raw frame -> typed message ----
